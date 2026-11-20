@@ -1,3 +1,5 @@
 @echo off
+setlocal
 chcp 65001 >nul
-py -3 "%USERPROFILE%\.claude\tools\review_scan.py" %*
+if not defined CLAUDE_DIR set "CLAUDE_DIR=%USERPROFILE%\.claude"
+py -3 "%CLAUDE_DIR%\tools\review_scan.py" %*

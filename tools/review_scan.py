@@ -24,6 +24,7 @@ import ast
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -93,9 +94,6 @@ SECRET_RE = re.compile(
     r"""(api_key|apikey|secret|password|access_key|secret_key|token|ak|sk)
         \s*=\s*['"]([A-Za-z0-9_\-]{16,})['"]""",
     re.IGNORECASE | re.VERBOSE)
-GO_SECRET_RE = re.compile(
-    r'\b(api_key|apikey|secret|password|access_key|secret_key|token|ak|sk)'
-    r'(?:\s+string)?\s*:?=\s*["\x60]([A-Za-z0-9_-]{16,})["\x60]', re.I)
 GETENV_RE = re.compile(r"os\.getenv|os\.environ|config\(|Config\(|process\.env\.")
 
 # Placeholder blacklist (historical hardcoded defaults)
@@ -178,9 +176,6 @@ FRAMEWORK_DETECT = {
     "nestjs": [r"@Controller", r"@Module", r"from ['\"]@nestjs"],
     "koa": [r"from ['\"]koa['\"]", r"require\(['\"]koa['\"]\)"],
     "spring": [r"@(Get|Post|Put|Delete|Request)Mapping", r"org\.springframework"],
-    "gin": [r'github\.com/gin-gonic/gin\b', r"gin\.(Default|New)"],
-    "echo": [r'github\.com/labstack/echo\b', r"echo\.(New|NewWithContext)"],
-    "net_http": [r'"net/http"', r"http\.HandleFunc", r"http\.Handle"],
     "axum": [r"axum::", r"Router::new"],
     "actix": [r"actix_web::", r"actix::", r"#\[get\(", r"#\[post\("],
 }
@@ -525,9 +520,9 @@ def _excluded(path, extra_exclude=None):
     dirs = EXCLUDE_DIRS
     if extra_exclude:
         dirs = dirs | extra_exclude
-    # bin/ normally holds build output, but is the source entry point for Dart CLIs.
+    # Dart CLI entry points and Go source can also live under bin/.
     return any(part in dirs for part in path.parts) or (
-        "bin" in path.parts and path.suffix.lower() != ".dart")
+        "bin" in path.parts and path.suffix.lower() not in {".dart", ".go"})
 
 
 # ---------------------------------------------------------------------------
@@ -615,12 +610,12 @@ def _py_spans(lines):
             if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))]
 
 
-def scope_findings(new_findings, path, rel, lines, added):
+def scope_findings(new_findings, path, rel, lines, added, scan_ranges=None):
     """Tag the findings one file produced with scope=diff|existing.
 
     A finding is `diff` when an edit lands inside the code it is about: the innermost def/class
-    (Python), or the reported line and the _NEIGHBOUR lines below it (other languages, scoped
-    categories only). Every other finding becomes severity INFO with scope=existing; the
+    (Python), the matching syntax node (Go), or the reported line and the _NEIGHBOUR lines
+    below it (other languages, scoped categories only). Every other finding becomes severity INFO with scope=existing; the
     original severity moves to orig_severity, so nothing is lost -- it just stops costing review
     time. Anything this cannot place (file not in the diff, unparsable source, unscoped
     category) is left exactly as it was: the fail-safe direction is to keep.
@@ -638,6 +633,8 @@ def scope_findings(new_findings, path, rel, lines, added):
             continue
         inner = [s for s in (spans or []) if s[0] <= line <= s[1]]
         lo, hi = min(inner, key=lambda s: s[1] - s[0]) if inner else (line, line + _NEIGHBOUR)
+        if scan_ranges is not None:
+            hi = scan_ranges[f["id"]]
         if any(lo <= t <= hi for t in touched):
             f["scope"] = "diff"
         else:
@@ -693,12 +690,11 @@ def detect_frameworks(unit_root):
     detected = set()
     # Sample files (limit to avoid scanning everything just for detection)
     sample_files = []
-    for ext in (".py", ".js", ".ts", ".java", ".go", ".rs"):
-        # A large Python or JS project must not exhaust the Go framework sample.
+    for ext in (".py", ".js", ".ts", ".java", ".rs"):
         candidates = (p for p in unit_root.rglob(f"*{ext}") if not _excluded(p))
         sample_files.extend(islice(candidates, 50))
 
-    all_text = "\n".join(read_lines(unit_root / "go.mod")) + "\n"
+    all_text = ""
     for p in sample_files:
         try:
             all_text += p.read_text(encoding="utf-8", errors="replace") + "\n"
@@ -949,52 +945,6 @@ def scan_routes_java(lines, subsystem, branch, rel, frameworks, auth_markers):
                 severity="P2")  # P2 because Spring auth is usually centralized
 
 
-GO_HTTP_ROUTE_RE = re.compile(
-    r'\b(\w+)\.(HandleFunc|Handle)\s*\(\s*["\x60]([^"\x60\n]+)["\x60]\s*,')
-GO_SERVE_MUX_RE = re.compile(r"\b(\w+)\s*:?=\s*http\.NewServeMux\s*\(")
-GO_FRAMEWORK_ROUTE_RE = re.compile(
-    r'\.(GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS|CONNECT|TRACE|Any)\s*\(\s*'
-    r'["\x60](/[^"\x60\n]*)["\x60]\s*,'
-    r'|\.(Handle|Add)\s*\(\s*(?:http\.Method(\w+)|"([A-Z]+)")\s*,\s*'
-    r'["\x60](/[^"\x60\n]*)["\x60]\s*,')
-
-
-def scan_routes_go(source, subsystem, branch, rel, frameworks):
-    """S1: Inventory literal registrations in gin, Echo and net/http."""
-    matches = []
-    code = mask_source(source)
-    if "net_http" in frameworks:
-        receivers = {"http", "mux"} | set(GO_SERVE_MUX_RE.findall(code))
-        for match in GO_HTTP_ROUTE_RE.finditer(source):
-            receiver, method, path = match.groups()
-            if receiver not in receivers or not code.startswith(receiver + ".", match.start()):
-                continue
-            # Go 1.22 ServeMux accepts patterns such as "GET /users/{id}".
-            if " " in path:
-                method, path = path.split(" ", 1)
-            matches.append((match.start(), "net_http", method, path))
-    web_frameworks = frameworks & {"gin", "echo"}
-    if web_frameworks:
-        local = {fw for fw in web_frameworks
-                 if any(re.search(pat, source) for pat in FRAMEWORK_DETECT[fw])}
-        label = "/".join(sorted(local or web_frameworks))
-        for match in GO_FRAMEWORK_ROUTE_RE.finditer(source):
-            if code[match.start()] != ".":
-                continue
-            method, path, register, method_const, method_literal, other_path = match.groups()
-            if register:
-                framework = "gin" if register == "Handle" else "echo"
-                if framework in web_frameworks:
-                    method = method_literal or method_const.upper()
-                    matches.append((match.start(), framework, method, other_path))
-            else:
-                matches.append((match.start(), label, method, path))
-
-    for offset, framework, method, path in sorted(matches):
-        add("", subsystem, branch, rel, source.count("\n", 0, offset) + 1, "route",
-            f"[{framework}] {method} {path}", severity="INFO")
-
-
 def scan_routes_rust(lines, subsystem, branch, rel, frameworks, auth_markers):
     """S1+S2 for Rust (axum, actix)."""
     for fw in ("axum", "actix"):
@@ -1090,7 +1040,6 @@ def check_unit_ssrf(subsystem, unit_root, branch, cfg):
 
 def scan_secrets(lines, subsystem, branch, rel):
     """S4: Detect hardcoded secrets/keys (16+ char string assignments)."""
-    pattern = GO_SECRET_RE if rel.lower().endswith(".go") else SECRET_RE
     for idx, ln in enumerate(lines, 1):
         # Placeholder blacklist
         for ph in SECRET_PLACEHOLDERS:
@@ -1101,7 +1050,7 @@ def scan_secrets(lines, subsystem, branch, rel):
         # Skip env/config reads
         if GETENV_RE.search(ln):
             continue
-        m = pattern.search(ln)
+        m = SECRET_RE.search(ln)
         if m:
             add("", subsystem, branch, rel, idx, "secret",
                 f"Suspected hardcoded secret: {m.group(1)}={m.group(2)[:8]}...(len={len(m.group(2))})",
@@ -1307,7 +1256,7 @@ def scan_timestamp_trust(lines, subsystem, branch, rel, is_frontend=False):
 
 def unit_has_auth(unit_root, auth_markers):
     """Check if unit backend has any auth markers at all."""
-    for ext in ("*.py", "*.js", "*.ts", "*.java", "*.go", "*.rs"):
+    for ext in ("*.py", "*.js", "*.ts", "*.java", "*.rs"):
         for p in unit_root.rglob(ext):
             if _excluded(p):
                 continue
@@ -1333,14 +1282,11 @@ def check_unit_auth(subsystem, unit_root, branch, auth_markers):
 C_STYLE_TOKENS = re.compile(
     r'//[^\n]*|/\*[\s\S]*?\*/|"""[\s\S]*?"""|\x27{3}[\s\S]*?\x27{3}'
     r'|\x60[^\x60]*\x60|"(?:\\.|[^"\\\n])*"|\x27(?:\\.|[^\x27\\\n])*\x27')
-GO_EMPTY_ERROR_RE = re.compile(
-    r'\bif\s+(?:[^{};\n]+;\s*)?(\w+)\s*!=\s*nil\s*\{\s*\}')
-GO_ERROR_NAME_RE = re.compile(r"^(?:err|error)$|^err(?:_|[A-Z])|(?:Err|Error|_err|_error)$")
 DART_EMPTY_CATCH_RE = re.compile(
     r'\b(?:on\s+[\w.]+(?:\s+catch\s*\([^)]*\))?|catch\s*\([^)]*\))'
     r'\s*\{\s*(?:return(?:\s+null)?\s*;\s*)?\}')
 DART_HTTP_IMPORT_RE = re.compile(
-    r"""\bimport\s+['"]package:http/http\.dart['"]\s*(?:as\s+(\w+)\s*)?;""")
+    r"""\bimport\s+['"]package:http/http\.dart['"]\s+as\s+(\w+)\b[^;]*;""")
 DART_HTTP_METHODS = r"get|post|put|patch|delete|head|read|readBytes"
 
 
@@ -1357,12 +1303,30 @@ def mask_source(source, keep_strings=False):
     return C_STYLE_TOKENS.sub(mask, source)
 
 
-def scan_go_errors(source, subsystem, branch, rel):
-    for match in GO_EMPTY_ERROR_RE.finditer(source):
-        name = match.group(1)
-        if GO_ERROR_NAME_RE.search(name):
-            add("", subsystem, branch, rel, source.count("\n", 0, match.start()) + 1,
-                "error_swallow", f"Go error branch is empty: if {name} != nil", severity="P2")
+def scan_go_sources(paths):
+    """Parse all selected Go files in one native subprocess."""
+    if not paths:
+        return {}, None
+    helper = Path(__file__).resolve().with_name("review_scan_go.go")
+    if not helper.is_file():
+        return {}, "Missing review_scan_go.go. Reinstall review-scan."
+    go = shutil.which("go")
+    if go is None:
+        return {}, "Go SDK is required to scan .go files. Install Go 1.22+ and add it to PATH."
+
+    # Compile only the bundled helper with the local SDK and standard library.
+    env = dict(os.environ, GOENV="off", GOFLAGS="", GO111MODULE="off", GOWORK="off",
+               GOTOOLCHAIN="local")
+    try:
+        out = subprocess.run([go, "run", str(helper)], cwd=str(helper.parent),
+                             input=json.dumps([str(path) for path in paths]),
+                             capture_output=True, text=True, encoding="utf-8",
+                             errors="replace", timeout=120, check=False, env=env)
+        if out.returncode:
+            return {}, f"Go AST scanner failed: {out.stderr.strip()[:1000]}"
+        return json.loads(out.stdout), None
+    except (OSError, subprocess.TimeoutExpired, ValueError) as exc:
+        return {}, f"Go AST scanner failed: {exc}"
 
 
 def scan_dart(source, subsystem, branch, rel, cfg):
@@ -1379,12 +1343,11 @@ def scan_dart(source, subsystem, branch, rel, cfg):
         if not code.startswith("import", match.start()):
             continue
         alias = match.group(1)
-        prefix = rf"\b{re.escape(alias)}\s*\.\s*" if alias else r"(?<![.\w])"
-        calls = re.compile(rf"{prefix}({DART_HTTP_METHODS})\s*\(")
+        calls = re.compile(rf"\b{re.escape(alias)}\s*\.\s*({DART_HTTP_METHODS})\s*\(")
         for call in calls.finditer(code):
             add("", subsystem, branch, rel, code.count("\n", 0, call.start()) + 1,
                 "bare_fetch", f"Direct package:http call ({call.group(1)}); check shared client handling",
-                severity="P2")
+                severity="INFO")
 
 
 # ---------------------------------------------------------------------------
@@ -1439,14 +1402,6 @@ def scan_one(path, subsystem, branch, unit_root, frameworks, auth_markers, cfg):
             scan_routes_java(lines, subsystem, branch, rel, frameworks, auth_markers)
         # S4 secrets
         scan_secrets(lines, subsystem, branch, rel)
-
-    elif ext == ".go":
-        source = "\n".join(lines)
-        uncommented = mask_source(source, keep_strings=True)
-        if frameworks & {"gin", "echo", "net_http"}:
-            scan_routes_go(uncommented, subsystem, branch, rel, frameworks)
-        scan_secrets(uncommented.split("\n"), subsystem, branch, rel)
-        scan_go_errors(mask_source(source), subsystem, branch, rel)
 
     elif ext == ".dart":
         source = "\n".join(lines)
@@ -1646,21 +1601,6 @@ def selftest():
     scan_routes_js(read_lines(f9), "test", "main", "server.js", {"express"}, auth_markers)
     has_express_route = any(f["category"] == "route" and "[express]" in f["evidence"] for f in _findings)
     check(has_express_route, "S1 detects Express routes")
-
-    # --- Fixture 10: gin (Go) route ---
-    f10 = tmpdir / "main.go"
-    f10.write_text(
-        'package main\n'
-        'import "github.com/gin-gonic/gin"\n'
-        'func main() {\n'
-        '    r := gin.Default()\n'
-        '    r.GET("/api/ping", handler)\n'
-        '}\n'
-    , encoding="utf-8")
-    _findings.clear()
-    scan_routes_go(f10.read_text(encoding="utf-8"), "test", "main", "main.go", {"gin"})
-    has_gin_route = any(f["category"] == "route" and "[gin]" in f["evidence"] for f in _findings)
-    check(has_gin_route, "S1 detects gin routes")
 
     # --- Fixture 11: axum (Rust) route ---
     f11 = tmpdir / "main.rs"
@@ -1866,15 +1806,18 @@ def selftest():
 
     subprocess.run(["git", "init", "-q", str(mixed)], check=True, capture_output=True)
     (mixed / "server.go").write_text(
-        'package fixture\nimport "net/http"\nfunc routes() {\n'
-        '  server := http.NewServeMux()\n'
+        'package fixture\n'
+        'import (web "net/http"; "github.com/gin-gonic/gin"; e "github.com/labstack/echo/v4")\n'
+        'func routes(router *gin.RouterGroup, echo *e.Echo) {\n'
+        '  server := web.NewServeMux()\n'
         '  server.HandleFunc("GET /users/{id}", handler)\n'
-        '  r.OPTIONS(\n    "/items", handler,\n  )\n'
-        '  if err := work(); err != nil { /* ignored */ }\n'
+        '  router.OPTIONS(\n    "/items", handler,\n  )\n'
+        '  if err := work(); nil != (err) { /* ignored */ }\n'
         '  if err := work(); err != nil { log(err) }\n'
-        '  token := `fakeFixtureToken99`\n'
-        '  // if err != nil {}\n'
-        '  r.Use(AuthMiddleware())\n}\n', encoding="utf-8")
+        '  token := ' + chr(96) + 'fakeFixtureToken99' + chr(96) + '\n'
+        '  echo.Add(web.MethodPost, "/echo", handler)\n'
+        '  log("if err != nil {}")\n'
+        '  other.GET("/not-a-route", handler)\n}\n', encoding="utf-8")
     (mixed / "mobile" / "loader.dart").write_text(
         "import 'package:http/http.dart' as api;\n"
         "void load() {\n"
@@ -1882,22 +1825,36 @@ def selftest():
         "  try { work(); } on Exception { rethrow; }\n"
         "  // try { work(); } catch (_) {}\n"
         "}\n", encoding="utf-8")
+    (mixed / "mobile" / "local.dart").write_text(
+        "import 'package:http/http.dart';\nvoid get() {}\nvoid run() => get();\n",
+        encoding="utf-8")
     for mode, full_flag in (("default", []), ("full", ["--full"])):
         run = subprocess.run([sys.executable, str(Path(__file__).resolve()), "--root", str(mixed),
                               "--json", *full_flag], capture_output=True, text=True, encoding="utf-8")
         output = json.loads(run.stdout)
         hits = [(f["file"], f["line"], f["category"]) for f in output["findings"]]
-        check(sorted(hits) == sorted([
+        check(not output.get("scan_errors") and sorted(hits) == sorted([
             ("server.go", 5, "route"), ("server.go", 6, "route"),
             ("server.go", 9, "error_swallow"), ("server.go", 11, "secret"),
+            ("server.go", 12, "route"),
             ("loader.dart", 3, "error_swallow"), ("loader.dart", 3, "bare_fetch"),
         ]), f"Go and Dart findings occur once on the right lines in {mode} mode")
+        check(all(f["severity"] == "INFO" for f in output["findings"] if f["category"] == "bare_fetch"),
+              f"Dart HTTP calls are inventory in {mode} mode")
+    (mixed / "broken.go").write_text("package fixture\nfunc {\n", encoding="utf-8")
+    run = subprocess.run([sys.executable, str(Path(__file__).resolve()), "--root", str(mixed), "--json"],
+                         capture_output=True, text=True, encoding="utf-8")
+    output = json.loads(run.stdout)
+    check(run.returncode != 0 and any(err.get("file") == "broken.go"
+                                      for err in output.get("scan_errors", []))
+          and any(f["file"] == "loader.dart" for f in output["findings"]),
+          "Go syntax errors are reported without hiding Flutter results")
+
     check((mixed / "cli" / "bin" / "cli.dart") in changed_files(mixed, None, True)
           and (mixed / "mobile" / ".dart_tool" / "generated.dart") not in changed_files(mixed, None, True),
           "Dart CLI sources are included and Flutter tool output is excluded")
 
     # Cleanup (git object files are read-only on Windows, so clear the bit before removing)
-    import shutil
     shutil.rmtree(tmpdir, onerror=lambda fn, p, _e: (os.chmod(p, 0o700), fn(p)))
 
     print(f"\nselftest {'all passed' if ok else 'HAS FAILURES'}")
@@ -1944,18 +1901,25 @@ def main():
     risk_paths = []
     # Scan files belonging to nested projects once, using their closest manifest.
     seen_files = set()
+    units_with_files = []
     for unit_name, unit_root, langs in sorted(units, key=lambda unit: -len(unit[1].parts)):
+        files = [path for path in changed_files(unit_root, args.base, args.full, extra_exclude)
+                 if path not in seen_files]
+        seen_files.update(files)
+        all_files.extend(files)
+        units_with_files.append((unit_name, unit_root, langs, files))
+
+    go_results, go_error = scan_go_sources([p for p in all_files if p.suffix.lower() == ".go"])
+    scan_errors = []
+    if go_error:
+        scan_errors.append({"language": "go", "message": go_error})
+
+    for unit_name, unit_root, langs, files in units_with_files:
         branch = get_branch(unit_root)
         frameworks = detect_frameworks(unit_root)
-
-        # Get files to scan
-        files = changed_files(unit_root, args.base, args.full, extra_exclude)
-        files = [path for path in files if path not in seen_files]
-        seen_files.update(files)
         if not files and not args.full:
             print(f"[{unit_name}] No uncommitted changes (use --full for full scan, "
                   f"--base <ref> for diff against base)", file=sys.stderr)
-        all_files.extend(files)
         git_dir = git_root(unit_root)
         risk_paths.extend(f.relative_to(git_dir).as_posix() for f in files)
         added = {} if args.full else added_line_map(git_dir, args.base)
@@ -1967,20 +1931,36 @@ def main():
             not langs and bool(source_extensions) and source_extensions <= {".go", ".dart"})
         if not go_or_dart_only:
             check_unit_auth(unit_name, unit_root, branch, auth_markers)
-            if get_ssrf_guard_functions(cfg):
+            if get_ssrf_guard_functions(cfg) and ("python" in langs or ".py" in source_extensions):
                 check_unit_ssrf(unit_name, unit_root, branch, cfg)
 
         # Per-file scanning
-        unit_start = len(_findings)
         for path in files:
             n0 = len(_findings)
-            scan_one(path, unit_name, branch, unit_root, frameworks, auth_markers, cfg)
+            scan_ranges = None
+            if path.suffix.lower() == ".go":
+                if go_error:
+                    continue
+                result = go_results[str(path)]
+                if result.get("error"):
+                    scan_errors.append({"language": "go", "file": path.relative_to(root).as_posix(),
+                                        "message": result["error"]})
+                    continue
+                scan_ranges = {}
+                for finding in result["findings"]:
+                    add("", unit_name, branch, path.relative_to(unit_root).as_posix(),
+                        finding["line"], finding["category"], finding["evidence"],
+                        severity=finding["severity"])
+                    scan_ranges[_findings[-1]["id"]] = finding["end_line"]
+            else:
+                scan_one(path, unit_name, branch, unit_root, frameworks, auth_markers, cfg)
             if added and len(_findings) > n0:
+                lines = [] if scan_ranges is not None else read_lines(path)
                 scope_findings(_findings[n0:], path, path.relative_to(git_dir).as_posix(),
-                               read_lines(path), added)
+                               lines, added, scan_ranges)
 
-        if go_or_dart_only and any(f["category"] == "route" for f in _findings[unit_start:]):
-            check_unit_auth(unit_name, unit_root, branch, auth_markers)
+    for error in scan_errors:
+        print(f"[scan error] {error['message']}", file=sys.stderr)
 
     risk = risk_level(risk_paths)
 
@@ -2010,14 +1990,16 @@ def main():
         output = {"risk": risk, "file_count": len(all_files),
                   "findings": [f for f in _findings if f["severity"] != "INFO"]
                   if args.actionable else _findings}
+        if scan_errors:
+            output["scan_errors"] = scan_errors
         if ver_results is not None:
             output["verification"] = {"passed": ver_passed, "results": ver_results}
         print(json.dumps(output, ensure_ascii=False, indent=2))
     else:
         print_summary(risk, len(all_files), ver_results)
 
-    # Return non-zero if findings or verification failed
-    if _findings:
+    # Return non-zero if findings exist or a scan or verification failed.
+    if _findings or scan_errors:
         return 1
     if args.verify and not ver_passed:
         return 1

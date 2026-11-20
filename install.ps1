@@ -11,6 +11,7 @@ if ($args -contains "--uninstall") {
     Remove-Item -Recurse -Force "$claudeDir\skills\bobo-code-review" -ErrorAction SilentlyContinue
     Remove-Item -Force "$claudeDir\docs\code-review-workflow-template.md" -ErrorAction SilentlyContinue
     Remove-Item -Force "$claudeDir\tools\review_scan.py" -ErrorAction SilentlyContinue
+    Remove-Item -Force "$claudeDir\tools\review_scan_go.go" -ErrorAction SilentlyContinue
     Write-Host "Uninstalled."
     exit 0
 }
@@ -28,7 +29,8 @@ Write-Host "[OK] Docs  -> $claudeDir\docs\code-review-workflow-template.md"
 # --- 3. Scanner ---
 New-Item -ItemType Directory -Force -Path "$claudeDir\tools" | Out-Null
 Copy-Item "$scriptDir\tools\review_scan.py" "$claudeDir\tools\review_scan.py"
-Write-Host "[OK] Tool  -> $claudeDir\tools\review_scan.py"
+Copy-Item "$scriptDir\tools\review_scan_go.go" "$claudeDir\tools\review_scan_go.go"
+Write-Host "[OK] Tools -> $claudeDir\tools"
 
 # --- 4. review-scan.cmd (try Python Scripts dir) ---
 $wrapperSrc = "$scriptDir\install\review-scan.cmd"

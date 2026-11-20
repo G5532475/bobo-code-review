@@ -14,7 +14,7 @@ if $UNINSTALL; then
   echo "Uninstalling bobo-code-review..."
   rm -rf "$CLAUDE_DIR/skills/bobo-code-review"
   rm -f  "$CLAUDE_DIR/docs/code-review-workflow-template.md"
-  rm -f  "$CLAUDE_DIR/tools/review_scan.py"
+  rm -f  "$CLAUDE_DIR/tools/review_scan.py" "$CLAUDE_DIR/tools/review_scan_go.go"
   # Remove review-scan wrapper
   for bindir in "$HOME/.local/bin" "$HOME/AppData/Roaming/Python/Python310/Scripts" "/usr/local/bin"; do
     rm -f "$bindir/review-scan" "$bindir/review-scan.cmd" 2>/dev/null || true
@@ -39,18 +39,14 @@ echo "[OK] Docs  → $CLAUDE_DIR/docs/code-review-workflow-template.md"
 # --- 3. Scanner ---
 mkdir -p "$CLAUDE_DIR/tools"
 cp "$SCRIPT_DIR/tools/review_scan.py" "$CLAUDE_DIR/tools/review_scan.py"
-echo "[OK] Tool  → $CLAUDE_DIR/tools/review_scan.py"
+cp "$SCRIPT_DIR/tools/review_scan_go.go" "$CLAUDE_DIR/tools/review_scan_go.go"
+echo "[OK] Tools → $CLAUDE_DIR/tools"
 
 # --- 4. review-scan wrapper ---
 install_wrapper() {
   local target="$1"
   if [[ -w "$(dirname "$target")" ]] || mkdir -p "$(dirname "$target")" 2>/dev/null; then
-    cat > "$target" << 'WRAPPER'
-#!/usr/bin/env python3
-import sys, os
-sys.argv[0] = os.path.expanduser("~/.claude/tools/review_scan.py")
-exec(open(sys.argv[0]).read())
-WRAPPER
+    cp "$SCRIPT_DIR/install/review-scan" "$target"
     chmod +x "$target"
     echo "[OK] Wrapper → $target"
     return 0

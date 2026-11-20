@@ -75,7 +75,7 @@ cd bobo-code-review
 # 手动复制文件：
 Copy-Item skills\bobo-code-review\SKILL.md $env:USERPROFILE\.claude\skills\bobo-code-review\
 Copy-Item docs\code-review-workflow-template.md $env:USERPROFILE\.claude\docs\
-Copy-Item tools\review_scan.py $env:USERPROFILE\.claude\tools\
+Copy-Item tools\review_scan.py,tools\review_scan_go.go $env:USERPROFILE\.claude\tools\
 
 # 创建 review-scan.cmd（放到 PATH 中，如 Python Scripts 目录）
 # 内容见 install/review-scan.cmd
@@ -92,8 +92,9 @@ bash install.sh --uninstall
 ## 依赖
 
 - **Claude Code** CLI
-- **Python 3.8+**（review_scan.py 仅用标准库，零第三方依赖）
-- **Go、Flutter 或 Dart SDK**（仅在 `--verify` 执行对应项目的验证命令时需要）
+- **Python 3.8+**（审查入口和通用规则）
+- **Go 1.22+**（扫描 `.go` 文件及运行 Go 验证时需要）
+- **Flutter 或 Dart SDK**（运行对应项目的 `--verify` 时需要）
 - **opengrep**（可选，用于 SAST 扫描）
 
 ---
@@ -104,7 +105,8 @@ bash install.sh --uninstall
 bobo-code-review/
 ├── skills/bobo-code-review/SKILL.md         # Skill 定义（按风险分档）
 ├── docs/code-review-workflow-template.md    # 通用方法论模板
-├── tools/review_scan.py                     # 确定性扫描器（零幻觉、可复现）
+├── tools/review_scan.py                     # 扫描入口与通用规则
+├── tools/review_scan_go.go                  # Go AST 扫描器
 ├── install.sh                               # Linux/macOS 安装脚本
 ├── install.ps1                              # Windows 安装参考
 ├── install/review-scan                      # Unix wrapper
@@ -164,7 +166,7 @@ AI 审查的问题：
 | S3 | SSRF | URL 参数是否校验目标地址 |
 | S4 | 密钥 | 硬编码密钥/密码/Token（16 位以上字符串赋值） |
 | S5 | 跨存储删除 | 删实体函数是否覆盖全部关联存储 |
-| S6 | 直接 HTTP 调用 | JS/TS 裸 `fetch()` 和 Dart 的 `package:http` 顶层请求调用，可配置排除项目封装 |
+| S6 | 直接 HTTP 调用 | JS/TS 裸 `fetch()` 和 Dart 通过带前缀的 `package:http` 导入调用顶层请求函数，可配置排除项目封装 |
 | S7 | 错误吞没 | 例如 Python `except: pass`、Go 空错误分支、Dart 空异常处理或直接返回 `null` |
 | S8 | 无界重试/OOM | `while True` 无 break / 循环内无界 append |
 | S9 | 时间戳污染 | 客户端 `Date.now()` 用于比较/排序 |
@@ -173,11 +175,13 @@ AI 审查的问题：
 
 | 项目 | 自动扫描 | 默认验证（`--verify`） |
 |---|---|---|
-| Go（`go.mod`） | gin、Echo 和 `net/http` 字面量路由，硬编码密钥，空错误分支 | `go test ./...`、`go vet ./...` |
+| Go（`go.mod`） | 用 Go AST 检查 gin、Echo 和 `net/http` 字面量路由、硬编码密钥和空错误分支 | `go test ./...`、`go vet ./...` |
 | Flutter（使用 Flutter SDK 的 `pubspec.yaml`） | `.dart` 文件中的硬编码密钥、空异常处理和直接 `package:http` 请求 | `flutter analyze`，存在 `test/**/*_test.dart` 时运行 `flutter test` |
 | Dart（其他 `pubspec.yaml`） | 同上，含 `bin/` 下的 Dart 入口 | `dart analyze`，存在 `test/**/*_test.dart` 时运行 `dart test` |
 
-路由清单用于追踪 Go 中间件和 handler 的实际鉴权。轻审也检查 Go 的错误传播与并发取消，以及 Flutter 的异步生命周期和资源释放。可用 `fetch_impl_files` 配置共享 HTTP 客户端文件，避免它自身的请求被标记。
+Go 扫描只解析选中的 Go 文件，使用本地 SDK 和标准库。缺少 SDK 或文件有语法错误会报告扫描失败。路由清单依赖文件内可识别的路由类型和字面量路径，遇到跨文件包装或动态注册时需追调用链。鉴权沿中间件和 handler 审查。并发取消、竞态、SSRF 和跨存储删除需要结合代码、配置及项目测试核对。
+
+Dart 当前的源码规则以文本匹配提供线索。带前缀的 `package:http` 顶层请求按 INFO 列出，供核对共享客户端策略。可用 `fetch_impl_files` 排除封装文件。Flutter 异步生命周期、资源释放和状态管理由人工轻审核对，`flutter analyze` 按项目的 `analysis_options.yaml` 执行分析。设备集成测试、平台构建及 Android / iOS 原生代码专项检查通过项目验证命令配置。
 
 纯 Dart 项目首次验证前，用 `dart pub get` 安装项目依赖。
 
@@ -196,7 +200,7 @@ review-scan --root <项目目录> --verify
 # JSON 输出
 review-scan --root <项目目录> --json
 
-# 自检
+# 自检（需要 Go SDK）
 review-scan --selftest
 ```
 
